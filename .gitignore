@@ -1,0 +1,5 @@
+# VS Code project folder
+.vscode/
+
+# GDB
+.gdb_history
