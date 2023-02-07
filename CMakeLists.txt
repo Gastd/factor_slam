@@ -27,6 +27,8 @@ else()
   set(EIGEN3_INCLUDE_DIRS ${EIGEN3_INCLUDE_DIR})
 endif()
 
+find_package(GTSAM REQUIRED)
+
 ## Find catkin macros and libraries
 ## if COMPONENTS list like find_package(catkin REQUIRED COMPONENTS xyz)
 ## is used, also find other catkin packages
@@ -172,6 +174,18 @@ add_dependencies(fuse_clouds_node ${catkin_EXPORTED_TARGETS})
 install(
   TARGETS
     fuse_clouds_node
+  ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+add_executable(slam_node src/slam_node.cpp)
+target_link_libraries(slam_node ${catkin_LIBRARIES} ${PCL_LIBRARIES} gtsam)
+add_dependencies(slam_node ${catkin_EXPORTED_TARGETS})
+
+install(
+  TARGETS
+    slam_node
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
