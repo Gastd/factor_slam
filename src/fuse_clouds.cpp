@@ -3,8 +3,6 @@
 
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
-#include <sensor_msgs/Imu.h>
-#include <nav_msgs/Odometry.h>
 #include <tf/transform_datatypes.h>
 
 #include <message_filters/subscriber.h>
@@ -14,7 +12,6 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
-#include <pcl/registration/icp.h>
 
 using namespace std;
 using namespace ros;
