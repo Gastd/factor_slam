@@ -46,11 +46,12 @@ public:
 
 private:
     bool first_scan_;
+    double min_scan_range_, max_scan_range_;
     int count_;
 
     ros::NodeHandle nh_;
     ros::Subscriber lidar_Sub_;
-    ros::Publisher map_pub_;
+    ros::Publisher map_pub_, source_pc_pub_, target_pc_pub_;
 
     gtsam::Pose3 last_pose_;
 
@@ -59,15 +60,23 @@ private:
     std::vector<pcl::PointCloud<pcl::PointXYZRGB>> map_list_;
 
     void pointcloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg);
+
+    void removeDynObj(pcl::PointCloud<pcl::PointXYZRGB>& cloud);
+    pcl::PointCloud<pcl::PointXYZRGB> removeGround(const pcl::PointCloud<pcl::PointXYZRGB>& cloud);
+    Eigen::Matrix4d transform2D(double theta, double xt, double yt);
 };
 
 SlamNode::SlamNode() :
 first_scan_(true),
+min_scan_range_(10.0),
+max_scan_range_(300.0),
 count_(0)
 {
     // ROS
     lidar_Sub_ = nh_.subscribe("output", 1, &SlamNode::pointcloudCallback, this);
     map_pub_ = nh_.advertise<sensor_msgs::PointCloud2> ("map", 1);
+    source_pc_pub_ = nh_.advertise<sensor_msgs::PointCloud2> ("source_pc_", 1);
+    target_pc_pub_ = nh_.advertise<sensor_msgs::PointCloud2> ("target_pc_", 1);
 
     // ICP
     icp_.setMaxCorrespondenceDistance(2.0);
@@ -76,12 +85,82 @@ count_(0)
     icp_.setMaximumIterations(50);
 }
 
+void SlamNode::removeDynObj(pcl::PointCloud<pcl::PointXYZRGB>& cloud)
+{
+    std::cout << "removing things...." << std::endl;
+    double r;
+    pcl::PointXYZRGB p;
+    pcl::PointCloud<pcl::PointXYZRGB> final;
+    for (pcl::PointCloud<pcl::PointXYZRGB>::const_iterator item = cloud.begin(); item != cloud.end(); item++)
+    {
+        p.x = (double)item->x;
+        p.y = (double)item->y;
+        p.z = (double)item->z;
+        p.r = (uint8_t)item->r;
+        p.g = (uint8_t)item->g;
+        p.b = (uint8_t)item->b;
+
+        r = sqrt(p.x*p.x + p.y*p.y);
+        if (min_scan_range_ > r)
+        {
+            continue;
+        }
+        if ((p.r == 0) && (p.g == 0) && (p.b == 142)) // vehicles
+        {
+            continue;
+        }
+        else if ((p.r == 220) && (p.g == 20) && (p.b == 60))
+        {
+            continue;
+        }
+        final.push_back(p);
+    }
+    cloud = final;
+}
+
+pcl::PointCloud<pcl::PointXYZRGB> SlamNode::removeGround(const pcl::PointCloud<pcl::PointXYZRGB>& cloud)
+{
+    pcl::PointXYZRGB p;
+    pcl::PointCloud<pcl::PointXYZRGB> final;
+    for (pcl::PointCloud<pcl::PointXYZRGB>::const_iterator item = cloud.begin(); item != cloud.end(); item++)
+    {
+        p.x = (double)item->x;
+        p.y = (double)item->y;
+        p.z = (double)item->z;
+        p.r = (uint8_t)item->r;
+        p.g = (uint8_t)item->g;
+        p.b = (uint8_t)item->b;
+
+        if (p.z >= 0.5)
+        {
+            final.push_back(p);
+        }
+    }
+    return final;
+}
+
+Eigen::Matrix4d SlamNode::transform2D(double theta, double xt, double yt)
+{
+    Eigen::Matrix4d matrix = Eigen::Matrix4d::Identity ();
+
+    matrix(0, 3) = xt;
+    matrix(1, 3) = yt;
+
+    matrix(0, 0) = cos(theta);
+    matrix(0, 1) = -sin(theta);
+    matrix(1, 0) = sin(theta);
+    matrix(1, 1) = cos(theta);
+
+    return matrix;
+}
+
 void SlamNode::pointcloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
 {
     pcl::PointCloud<pcl::PointXYZRGB> in_cloud_;
     Eigen::Matrix4d transformation_matrix = Eigen::Matrix4d::Identity();
     pcl::fromROSMsg(*msg,   in_cloud_);
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr source(new pcl::PointCloud<pcl::PointXYZRGB>(in_cloud_));
+    removeDynObj(in_cloud_);
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr source(new pcl::PointCloud<pcl::PointXYZRGB>(removeGround(in_cloud_)));
 
     std::cout << "count_ = " << count_++ << std::endl;
     if (first_scan_)
@@ -90,11 +169,11 @@ void SlamNode::pointcloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
         // initial_estimate_.insert(0, pose);
         last_pose_ = pose;
         first_scan_ = false;
+        map_list_.push_back(in_cloud_);
     }
     else
     {
         // get last transformation
-        // if !(map_list_.size() > 0) std::cout << "fodeu lista = " << count_++ << std::endl;
         pcl::PointCloud<pcl::PointXYZRGB>::Ptr target(new pcl::PointCloud<pcl::PointXYZRGB>(map_list_.back()));
         pcl::PointCloud<pcl::PointXYZRGB> final;
         icp_.setInputSource(source);
@@ -104,8 +183,35 @@ void SlamNode::pointcloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
             std::cout << "has converged: " << icp_.hasConverged() << " score: " << icp_.getFitnessScore() << std::endl;
             transformation_matrix = icp_.getFinalTransformation().cast<double>();
             print4x4Matrix(transformation_matrix);
-            
-            
+
+            gtsam::Pose3 new_pose = last_pose_.compose(gtsam::Pose3(gtsam::Rot3(transformation_matrix.block<3,3>(0, 0)),
+                gtsam::Point3(transformation_matrix(0, 3), transformation_matrix(1, 3), transformation_matrix(2, 3))));
+            last_pose_ = new_pose;
+            // publish compiled map
+            Eigen::Matrix4d tf = last_pose_.matrix();
+            pcl::PointCloud<pcl::PointXYZRGB>::Ptr transformed_source(new pcl::PointCloud<pcl::PointXYZRGB>);
+            pcl::transformPointCloud (in_cloud_, *transformed_source, tf);
+            map_ += *transformed_source;
+            map_list_.push_back(in_cloud_);
+
+            sensor_msgs::PointCloud2 output, source_pc_, target_pc_;
+            pcl::toROSMsg(map_, output);
+            pcl::toROSMsg(*transformed_source, source_pc_);
+            pcl::toROSMsg(*target, target_pc_);
+            output.header.frame_id = msg->header.frame_id;
+            output.header.stamp = msg->header.stamp;
+            source_pc_.header.frame_id = msg->header.frame_id;
+            source_pc_.header.stamp = msg->header.stamp;
+            target_pc_.header.frame_id = msg->header.frame_id;
+            target_pc_.header.stamp = msg->header.stamp;
+            map_pub_.publish(output);
+            source_pc_pub_.publish(source_pc_);
+            target_pc_pub_.publish(target_pc_);
+
+            transformation_matrix = last_pose_.matrix();
+            std::cout << "x= " << last_pose_.x() << " y= "<< last_pose_.y() << " z= " << last_pose_.z() << std::endl
+                      << "roll= " << last_pose_.rotation().roll() << " pitch= " << last_pose_.rotation().pitch() << " yaw= " << last_pose_.rotation().yaw() << std::endl; 
+
             /*
             // Get transformation from ICP result and update pose estimate
             Eigen::Matrix4f transformation = icp_.getFinalTransformation();
@@ -121,18 +227,8 @@ void SlamNode::pointcloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
             last_pose_ = new_pose;
             */
         }
+        else    return;
     }
-
-    map_list_.push_back(in_cloud_);
-    // publish compiled map
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr transformed_source(new pcl::PointCloud<pcl::PointXYZRGB>);
-    pcl::transformPointCloud (*source, *transformed_source, transformation_matrix);
-    map_ += *transformed_source;
-    sensor_msgs::PointCloud2 output;
-    pcl::toROSMsg(map_, output);
-    output.header.frame_id = msg->header.frame_id;
-    output.header.stamp = msg->header.stamp;
-    map_pub_.publish(output);
 }
 
 
