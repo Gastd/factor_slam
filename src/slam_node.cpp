@@ -20,6 +20,14 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/registration/icp.h>
 
+#include <pcl/search/organized.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/features/normal_3d_omp.h>
+#include <pcl/filters/conditional_removal.h>
+#include <pcl/segmentation/extract_clusters.h>
+
+#include <pcl/features/don.h>
+
 // GTSAM
 #include <Eigen/Core>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
@@ -56,6 +64,8 @@ private:
     gtsam::Pose3 last_pose_;
 
     pcl::IterativeClosestPoint<pcl::PointXYZRGB, pcl::PointXYZRGB, double> icp_;
+    pcl::IterativeClosestPointWithNormals<pcl::PointXYZRGBNormal, pcl::PointXYZRGBNormal, double> point2plane_icp_;
+
     pcl::PointCloud<pcl::PointXYZRGB> map_;
     std::vector<pcl::PointCloud<pcl::PointXYZRGB>> map_list_;
 
@@ -63,6 +73,8 @@ private:
 
     void removeDynObj(pcl::PointCloud<pcl::PointXYZRGB>& cloud);
     pcl::PointCloud<pcl::PointXYZRGB> removeGround(const pcl::PointCloud<pcl::PointXYZRGB>& cloud);
+    pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr computeNormals(pcl::PointCloud<pcl::PointXYZRGB>::Ptr src);
+
     Eigen::Matrix4d transform2D(double theta, double xt, double yt);
 };
 
@@ -83,6 +95,12 @@ count_(0)
     icp_.setTransformationEpsilon(1e-6);
     icp_.setEuclideanFitnessEpsilon(1e-6);
     icp_.setMaximumIterations(50);
+
+    // Point  to Plane ICP
+    point2plane_icp_.setMaxCorrespondenceDistance(2.0);
+    point2plane_icp_.setTransformationEpsilon(1e-6);
+    point2plane_icp_.setEuclideanFitnessEpsilon(1e-6);
+    point2plane_icp_.setMaximumIterations(50);
 }
 
 void SlamNode::removeDynObj(pcl::PointCloud<pcl::PointXYZRGB>& cloud)
@@ -154,6 +172,99 @@ Eigen::Matrix4d SlamNode::transform2D(double theta, double xt, double yt)
     return matrix;
 }
 
+pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr SlamNode::computeNormals(pcl::PointCloud<pcl::PointXYZRGB>::Ptr src)
+{
+    ///The smallest scale to use in the DoN filter.
+    double scale1;
+    ///The largest scale to use in the DoN filter.
+    double scale2;
+    ///The minimum DoN magnitude to threshold by
+    double threshold;
+    ///segment scene into clusters with given distance tolerance using euclidean clustering
+    double segradius;
+
+    // // Create a search tree, use KDTreee for non-organized data.
+    // pcl::search::Search<pcl::PointXYZRGB>::Ptr tree;
+    // if (src->isOrganized ())
+    // {
+    //     tree.reset (new pcl::search::OrganizedNeighbor<pcl::PointXYZRGB> ());
+    // }
+    // else
+    // {
+    //     tree.reset (new pcl::search::KdTree<pcl::PointXYZRGB> (false));
+    // }
+
+    // Create the normal estimation class, and pass the input dataset to it
+    // pcl::NormalEstimation<pcl::PointXYZRGB, pcl::Normal> ne;
+    pcl::NormalEstimationOMP<pcl::PointXYZRGB, pcl::PointNormal> ne;
+    ne.setInputCloud(src);
+
+    ne.setViewPoint (std::numeric_limits<float>::max (), std::numeric_limits<float>::max (), std::numeric_limits<float>::max ());
+
+    // Create an empty kdtree representation, and pass it to the normal estimation object.
+    // Its content will be filled inside the object, based on the given input dataset(as no other search surface is given).
+    pcl::search::KdTree<pcl::PointXYZRGB>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZRGB>());
+    // Set the input pointcloud for the search tree
+    tree->setInputCloud (src);
+    ne.setSearchMethod(tree);
+
+    // Output datasets
+    pcl::PointCloud<pcl::PointNormal>::Ptr cloud_normals(new pcl::PointCloud<pcl::PointNormal>());
+
+    // Use all neighbors in a sphere of radius 3cm
+    ne.setRadiusSearch(1);
+
+    // Compute the features
+    ne.compute(*cloud_normals);
+
+    // pcl::concatenateFields(*src, *cloud_normals, *dst_ptr);
+    pcl::PointCloud<pcl::PointXYZRGBNormal> dst;
+    // Initialization part
+    dst.width = src->width;
+    dst.height = src->height;
+    dst.is_dense = true;
+    dst.points.resize(dst.width * dst.height);
+
+    // Assignment part
+    for (int i = 0; i < cloud_normals->points.size(); i++)
+    {
+        dst.points[i].x = src->points[i].x;
+        dst.points[i].y = src->points[i].y;
+        dst.points[i].z = src->points[i].z;
+
+        // std::cout << " x = " <<dst.points[i].x;
+        // std::cout << " y = " <<dst.points[i].y;
+        // std::cout << " z = " <<dst.points[i].z << std::endl;
+
+        dst.points[i].r = src->points[i].r;
+        dst.points[i].g = src->points[i].g;
+        dst.points[i].b = src->points[i].b;
+
+    // cloud_normals -> Which you have already have; generated using pcl example code 
+
+        dst.points[i].curvature = cloud_normals->points[i].curvature;
+
+        dst.points[i].normal_x = cloud_normals->points[i].normal_x;
+        dst.points[i].normal_y = cloud_normals->points[i].normal_y;
+        dst.points[i].normal_z = cloud_normals->points[i].normal_z;
+
+        // std::cout << " curvature = " << dst.points[i].curvature;
+        // std::cout << " normal_x = " << dst.points[i].normal_x;
+        // std::cout << " normal_y = " << dst.points[i].normal_y;
+        // std::cout << " normal_z = " << dst.points[i].normal_z << std::endl;
+    }
+
+    pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr dst_ptr(new pcl::PointCloud<pcl::PointXYZRGBNormal>(dst));
+    pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr dst_filtered_ptr(new pcl::PointCloud<pcl::PointXYZRGBNormal>());
+
+    std::cout << "Dst has #" << dst_ptr->points.size() << " points" << std::endl;
+    boost::shared_ptr<std::vector<int>> indices(new std::vector<int>);
+    pcl::removeNaNFromPointCloud(*dst_ptr, *dst_filtered_ptr, *indices);
+    std::cout << "Deleting #" << dst_ptr->points.size() - dst_filtered_ptr->points.size() << " points" << std::endl;
+
+    return dst_ptr;
+}
+
 void SlamNode::pointcloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
 {
     pcl::PointCloud<pcl::PointXYZRGB> in_cloud_;
@@ -175,13 +286,16 @@ void SlamNode::pointcloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
     {
         // get last transformation
         pcl::PointCloud<pcl::PointXYZRGB>::Ptr target(new pcl::PointCloud<pcl::PointXYZRGB>(map_list_.back()));
+        pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr source_normals_ptr(computeNormals(source));
+        pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr target_normals_ptr(computeNormals(target));
         pcl::PointCloud<pcl::PointXYZRGB> final;
-        icp_.setInputSource(source);
-        icp_.setInputTarget(target);
-        icp_.align(final);
-        if (icp_.hasConverged()) {
-            std::cout << "has converged: " << icp_.hasConverged() << " score: " << icp_.getFitnessScore() << std::endl;
-            transformation_matrix = icp_.getFinalTransformation().cast<double>();
+        pcl::PointCloud<pcl::PointXYZRGBNormal> final_normals;
+        point2plane_icp_.setInputSource(source_normals_ptr);
+        point2plane_icp_.setInputTarget(target_normals_ptr);
+        point2plane_icp_.align(final_normals);
+        if (point2plane_icp_.hasConverged()) {
+            std::cout << "has converged: " << point2plane_icp_.hasConverged() << " score: " << point2plane_icp_.getFitnessScore() << std::endl;
+            transformation_matrix = point2plane_icp_.getFinalTransformation().cast<double>();
             print4x4Matrix(transformation_matrix);
 
             gtsam::Pose3 new_pose = last_pose_.compose(gtsam::Pose3(gtsam::Rot3(transformation_matrix.block<3,3>(0, 0)),
